@@ -1,7 +1,9 @@
 import std/[os, strformat, strutils]
-import ../[av, cli, ffmpeg, log, mic, transcribe]
+import ../[av, cli, ffmpeg, log, transcribe]
 import ../util/[dnorm16, fun]
 import ./help
+when defined(macosx):
+  import ../mic  # CoreAudio device picker + avfoundation capture (macOS only)
 
 # Ctrl-C stops transcription cleanly: the hook just flips a flag the read loop
 # polls, so we can flush the in-progress utterance before exiting.
@@ -63,9 +65,6 @@ proc main*(cArgs: seq[string]) =
     error "A model is needed, you came find them here: https://huggingface.co/ggerganov/whisper.cpp"
 
   let isMic = (inputPath == ":mic")
-  when not defined(macosx):
-    if isMic:
-      error "Microphone capture (:mic) is only supported on macOS"
   # Install early so Ctrl-C is graceful even during the (slow) model load.
   setControlCHook(onCtrlC)
 
@@ -90,29 +89,34 @@ proc main*(cArgs: seq[string]) =
   var input: InputContainer
 
   if isMic:
-    let (devName, warn) = chooseMicDevice()
-    if devName == "":
-      error "No microphone found"
-    if warn != "":
-      warning warn
+    # avfoundation indev + CoreAudio device pick are macOS-only; off-mac this
+    # path isn't compiled (it would pull in libavdevice, which we don't link).
+    when defined(macosx):
+      let (devName, warn) = chooseMicDevice()
+      if devName == "":
+        error "No microphone found"
+      if warn != "":
+        warning warn
 
-    avdevice_register_all()
-    let avf = av_find_input_format("avfoundation")
-    if avf == nil:
-      error "This build has no avfoundation input device"
-    # ":<name>" selects audio only (empty video field); avfoundation matches the
-    # name against each device's localizedName.
-    if avformat_open_input(addr fmtCtx, (":" & devName).cstring, avf, nil) < 0:
-      error &"Could not open microphone \"{devName}\""
-    if avformat_find_stream_info(fmtCtx, nil) < 0:
-      error "Could not read microphone stream info"
-    for i in 0 ..< fmtCtx.nb_streams.int:
-      if fmtCtx.streams[i].codecpar.codec_type == AVMEDIA_TYPE_AUDIO:
-        audioStream = fmtCtx.streams[i]
-        break
-    if audioStream == nil:
-      error "Microphone has no audio stream"
-    stderr.writeLine(&"Listening on \"{devName}\"... (press Ctrl-C to stop)")
+      avdevice_register_all()
+      let avf = av_find_input_format("avfoundation")
+      if avf == nil:
+        error "This build has no avfoundation input device"
+      # ":<name>" selects audio only (empty video field); avfoundation matches
+      # the name against each device's localizedName.
+      if avformat_open_input(addr fmtCtx, (":" & devName).cstring, avf, nil) < 0:
+        error &"Could not open microphone \"{devName}\""
+      if avformat_find_stream_info(fmtCtx, nil) < 0:
+        error "Could not read microphone stream info"
+      for i in 0 ..< fmtCtx.nb_streams.int:
+        if fmtCtx.streams[i].codecpar.codec_type == AVMEDIA_TYPE_AUDIO:
+          audioStream = fmtCtx.streams[i]
+          break
+      if audioStream == nil:
+        error "Microphone has no audio stream"
+      stderr.writeLine(&"Listening on \"{devName}\"... (press Ctrl-C to stop)")
+    else:
+      error "Microphone capture (:mic) is only supported on macOS"
   else:
     input = (try: av.open(inputPath) except: error "Invalid media file")
     if input.audio.len == 0:
